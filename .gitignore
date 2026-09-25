@@ -1,0 +1,31 @@
+# Ignore all datasets and large archive files
+*.zip
+*.tsv
+*.csv
+*.parquet
+*.pkl
+*.feather
+*.h5
+*.tar.gz
+*.gz
+
+# Ignore dataset directory specifically
+student_resource/dataset/
+dataset/
+
+# Ignore virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Ignore outputs and submission artifacts
+output/
+
+# Ignore cache and temporary directories
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.DS_Store
+__MACOSX/
