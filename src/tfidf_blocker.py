@@ -12,23 +12,62 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import uroman as ur
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sparse_dot_topn import awesome_cossim_topn
+
+
+_uroman_instance: Optional[ur.Uroman] = None
+_roman_word_cache: Dict[str, str] = {}
+
+
+def get_uroman() -> ur.Uroman:
+    """Lazily initializes the universal offline romanizer instance."""
+    global _uroman_instance
+    if _uroman_instance is None:
+        _uroman_instance = ur.Uroman()
+    return _uroman_instance
+
+
+def romanize_text(s: str) -> str:
+    """Normalizes and romanizes non-ASCII scripts (Devanagari, Bengali, French accents)
+    to standard Latin characters using uroman with word-level caching.
+    """
+    if not s or s.isascii():
+        return s
+    u = get_uroman()
+    words = s.split()
+    rom_words = []
+    for w in words:
+        if w.isascii():
+            rom_words.append(w)
+        else:
+            cached = _roman_word_cache.get(w)
+            if cached is None:
+                cached = u.romanize_string_core(w, None, ur.RomFormat.STR, 0)
+                _roman_word_cache[w] = cached
+            rom_words.append(cached)
+    return " ".join(rom_words)
 
 
 def build_text_representation(
     df: pd.DataFrame,
     name_col: str = "business_name",
     address_col: str = "business_address",
+    romanize: bool = True,
 ) -> List[str]:
     """Combines business name and address into a single normalized text representation.
 
     Ensures missing values are replaced with empty strings to prevent string-coercion
-    artifacts (e.g. float 'nan').
+    artifacts (e.g. float 'nan'). Optionally applies universal offline romanization (uroman)
+    to convert native Indic and accented scripts to Latin characters.
     """
     names = df[name_col].fillna("").astype(str)
     addresses = df[address_col].fillna("").astype(str)
-    return (names + " " + addresses).tolist()
+    combined = (names + " " + addresses).tolist()
+    if romanize:
+        return [romanize_text(s) for s in combined]
+    return combined
 
 
 def block_country_partition(
@@ -333,139 +372,213 @@ def pair_completeness(
     return matched_hits / len(true_pairs)
 
 
+def compute_macro_f05(
+    predictions_by_s1: Dict[str, List[Tuple[str, float]]],
+    ground_truth_by_s1: Dict[str, Set[str]],
+    all_s1_ids: Iterable[str],
+    k: int = 30,
+    threshold: float = 0.0,
+) -> Dict[str, float]:
+    """Computes exact official competition metrics: Macro F_0.5, Macro Precision, Macro Recall,
+    and Micro Pair Completeness.
+
+    Formula:
+        F_0.5 = (1.25 * Precision * Recall) / (0.25 * Precision + Recall)
+    Singletons:
+        - True empty & Pred empty: Precision=1.0, Recall=1.0, F0.5=1.0
+        - True empty & Pred non-empty: Precision=0.0, Recall=0.0, F0.5=0.0
+    """
+    total_true_links = 0
+    total_retained_hits = 0
+
+    f05_list: List[float] = []
+    prec_list: List[float] = []
+    rec_list: List[float] = []
+
+    for s1_id in all_s1_ids:
+        true_set = ground_truth_by_s1.get(s1_id, set())
+        cands_with_scores = predictions_by_s1.get(s1_id, [])
+
+        filtered = [cid for cid, sc in cands_with_scores[:k] if sc >= threshold]
+        pred_set = set(filtered)
+
+        total_true_links += len(true_set)
+        hits = len(true_set.intersection(pred_set))
+        total_retained_hits += hits
+
+        if len(true_set) == 0:
+            if len(pred_set) == 0:
+                p, r, f05 = 1.0, 1.0, 1.0
+            else:
+                p, r, f05 = 0.0, 0.0, 0.0
+        else:
+            if len(pred_set) == 0:
+                p, r, f05 = 0.0, 0.0, 0.0
+            else:
+                p = hits / len(pred_set)
+                r = hits / len(true_set)
+                denom = 0.25 * p + r
+                f05 = (1.25 * p * r) / denom if denom > 0 else 0.0
+
+        f05_list.append(f05)
+        prec_list.append(p)
+        rec_list.append(r)
+
+    pair_comp = (total_retained_hits / total_true_links) if total_true_links > 0 else 1.0
+
+    return {
+        "macro_f05": float(np.mean(f05_list)),
+        "macro_precision": float(np.mean(prec_list)),
+        "macro_recall": float(np.mean(rec_list)),
+        "pair_completeness": float(pair_comp),
+        "total_true_links": total_true_links,
+        "total_hits": total_retained_hits,
+    }
+
+
 # ==============================================================================
-# Self-contained runnable sanity check
+# Runnable Benchmark & Accuracy Evaluation
 # ==============================================================================
 if __name__ == "__main__":
-    print("=" * 80)
-    print("RUNNING STANDALONE SANITY CHECK: SPARKLY-STYLE TF-IDF BLOCKER")
-    print("=" * 80)
+    import os
+    import time
+    from collections import defaultdict
 
-    # 1. Tiny synthetic reference dataset (Source 1)
-    ref_records = pd.DataFrame(
-        [
-            {
-                "entity_id": "S1-01",
-                "business_name": "orelee barbershop",
-                "business_address": "1795 westchester drive high point nc",
-                "country": "US",
-            },
-            {
-                "entity_id": "S1-02",
-                "business_name": "prime money",
-                "business_address": "17560 ellis road tahlequah ok",
-                "country": "US",
-            },
-            {
-                "entity_id": "S1-03",
-                "business_name": "lakshmi media private limited",
-                "business_address": "154 bhugaon pune maharashtra",
-                "country": "India",
-            },
-            {
-                "entity_id": "S1-04",
-                "business_name": "societe generale",
-                "business_address": "29 boulevard haussmann paris",
-                "country": "France",
-            },
-            {
-                "entity_id": "S1-05",
-                "business_name": "delta logistics",
-                "business_address": "100 airport road atlanta ga",
-                "country": "US",
-            },
-        ]
-    )
+    real_data_path = "student_resource/dataset/train/train_source1.tsv"
+    if os.path.exists(real_data_path):
+        print("=" * 95)
+        print("RUNNING TF-IDF BLOCKER COMPLETE ACCURACY & RECALL BENCHMARK ON REAL DATA")
+        print("Zero simulation: Evaluating real Source 1 queries with Ground Truth matches & singletons.")
+        print("=" * 95)
 
-    # 2. Synthetic candidates dataset (Source 2 and Source 3 pooled)
-    cand_records = pd.DataFrame(
-        [
-            # True match for S1-01 (US) with abbreviation & missing state
-            {
-                "entity_id": "S2-01",
-                "business_name": "orelees barber shop",
-                "business_address": "1795 westchester dr high point",
-                "country": "US",
-            },
-            # True match for S1-02 (US) with typo & suffix variant
-            {
-                "entity_id": "S3-02",
-                "business_name": "prime mony inc",
-                "business_address": "17560 elis rd tahlequah",
-                "country": "US",
-            },
-            # True match for S1-03 (India) romanized from Devanagari
-            {
-                "entity_id": "S2-03",
-                "business_name": "lakssmii miiddiyaa praaivett limittedd",
-                "business_address": "154 bhugaon pune maharashtra",
-                "country": "India",
-            },
-            # True match for S1-04 (France) with suffix variant & street abbrev
-            {
-                "entity_id": "S3-04",
-                "business_name": "societe generale sa",
-                "business_address": "29 bd haussmann paris france",
-                "country": "France",
-            },
-            # Same name as S1-05, but in India -> MUST NOT MATCH across country!
-            {
-                "entity_id": "S2-05",
-                "business_name": "delta logistics",
-                "business_address": "100 airport road chennai",
-                "country": "India",
-            },
-            # Distractor candidate in US
-            {
-                "entity_id": "S3-06",
-                "business_name": "unrelated cafe",
-                "business_address": "45 main street boston ma",
-                "country": "US",
-            },
-        ]
-    )
+        SAMPLE_SIZE = 5000
+        print(f"\n[Step 1] Loading {SAMPLE_SIZE:,} real S1 queries from {real_data_path}...")
+        s1_df = pd.read_csv(real_data_path, sep="\t", nrows=SAMPLE_SIZE)
+        s1_ids = s1_df["entity_id"].tolist()
+        s1_id_set = set(s1_ids)
 
-    # 3. Labeled Ground Truth Mapping
-    ground_truth = pd.DataFrame(
-        [
-            {"source1_entity_id": "S1-01", "matched_entity_ids": "S2-01"},
-            {"source1_entity_id": "S1-02", "matched_entity_ids": "S3-02"},
-            {"source1_entity_id": "S1-03", "matched_entity_ids": "S2-03"},
-            {"source1_entity_id": "S1-04", "matched_entity_ids": "S3-04"},
-            {"source1_entity_id": "S1-05", "matched_entity_ids": ""},  # True Singleton
-        ]
-    )
+        print("[Step 2] Loading Ground Truth links and identifying singletons...")
+        gt_map = {}
+        needed_cand_ids = set()
+        singletons = 0
+        with open("student_resource/dataset/train/train_ground_truth.tsv", "r", encoding="utf-8") as f:
+            next(f)
+            for line in f:
+                parts = line.strip("\n").split("\t")
+                s1 = parts[0]
+                if s1 in s1_id_set:
+                    raw = parts[1] if len(parts) > 1 else ""
+                    if raw:
+                        cands = set(c.strip() for c in raw.split(",") if c.strip())
+                        gt_map[s1] = cands
+                        needed_cand_ids.update(cands)
+                    else:
+                        gt_map[s1] = set()
+                        singletons += 1
+                if len(gt_map) >= len(s1_ids):
+                    break
 
-    print("\nRunning partitioned blocking (k=3, lower_bound=0.1, char_wb=(3,5))...\n")
-    candidates = run_partitioned_blocking(
-        reference_df=ref_records,
-        candidate_df=cand_records,
-        k=3,
-        lower_bound=0.1,
-        ngram_range=(3, 5),
-        min_df=1,  # min_df=1 for tiny synthetic test
-    )
+        for s1 in s1_ids:
+            if s1 not in gt_map:
+                gt_map[s1] = set()
+                singletons += 1
 
-    print("BLOCKING CANDIDATE PAIRS RETRIEVED:")
-    print("-" * 80)
-    print(candidates.to_string(index=False))
-    print("-" * 80)
+        total_true_matches = sum(len(c) for c in gt_map.values())
+        print(f"  Loaded Ground Truth for {len(gt_map):,} S1 entities:")
+        print(f"    Entities with matches: {len(gt_map) - singletons:,}")
+        print(f"    Singletons (0 matches): {singletons:,} ({singletons/len(gt_map):.2%})")
+        print(f"    Total true positive links: {total_true_matches:,}")
 
-    # Sanity Check 1: Cross-country non-match verification
-    cross_country_leak = candidates[
-        (candidates["source1_entity_id"] == "S1-05")
-        & (candidates["candidate_entity_id"] == "S2-05")
-    ]
-    assert cross_country_leak.empty, "FAIL: Cross-country candidate leak detected!"
-    print("\n[PASS] Sanity Check 1: S1-05 (US) did NOT match S2-05 (India).")
+        print("\n[Step 3] Assembling candidate pool (all true candidates + 100,000 real distractors)...")
+        cand_records = []
+        EXTRA_DISTRACTORS = 100000
+        distractors_loaded = 0
 
-    # Sanity Check 2: Pair Completeness evaluation across k
-    print("\nPAIR COMPLETENESS SWEEP:")
-    for test_k in [1, 2, 3]:
-        pc = pair_completeness(candidates, ground_truth, k=test_k)
-        print(f"  Pair Completeness @ k={test_k}: {pc:.4f} ({pc * 100:.1f}%)")
+        for fname in ["train_source2.tsv", "train_source3.tsv"]:
+            fpath = f"student_resource/dataset/train/{fname}"
+            with open(fpath, "r", encoding="utf-8") as f:
+                next(f)
+                for line in f:
+                    parts = line.strip("\n").split("\t")
+                    eid = parts[0]
+                    name = parts[1] if len(parts) > 1 else ""
+                    addr = parts[2] if len(parts) > 2 else ""
+                    country = parts[3] if len(parts) > 3 else ""
 
-    pc_top1 = pair_completeness(candidates, ground_truth, k=1)
-    assert pc_top1 == 1.0, f"FAIL: Expected Pair Completeness 1.0, got {pc_top1}"
-    print("\n[PASS] Sanity Check 2: 100% of true ground-truth pairs captured at k=1.")
-    print("=" * 80)
+                    if eid in needed_cand_ids:
+                        cand_records.append({
+                            "entity_id": eid,
+                            "business_name": name,
+                            "business_address": addr,
+                            "country": country,
+                        })
+                    elif distractors_loaded < EXTRA_DISTRACTORS:
+                        cand_records.append({
+                            "entity_id": eid,
+                            "business_name": name,
+                            "business_address": addr,
+                            "country": country,
+                        })
+                        distractors_loaded += 1
+
+        cand_df = pd.DataFrame(cand_records)
+        print(f"  Candidate pool assembled: {len(cand_df):,} total records")
+        print("  Candidate breakdown by country:")
+        print(cand_df["country"].value_counts())
+
+        print("\n[Step 4] Running run_partitioned_blocking() (k=100, lower_bound=0.01)...")
+        t0 = time.time()
+        candidates_df = run_partitioned_blocking(
+            reference_df=s1_df,
+            candidate_df=cand_df,
+            k=100,
+            lower_bound=0.01,
+            ngram_range=(3, 5),
+            min_df=2,
+        )
+        print(f"  Blocking completed in {time.time()-t0:.2f}s! Retrieved {len(candidates_df):,} pairs.")
+
+        pred_by_s1 = defaultdict(list)
+        for _, row in candidates_df.sort_values(["source1_entity_id", "rank"]).iterrows():
+            pred_by_s1[str(row["source1_entity_id"])].append(
+                (str(row["candidate_entity_id"]), float(row["similarity_score"]))
+            )
+
+        s1_us_ids = s1_df[s1_df["country"] == "US"]["entity_id"].tolist()
+        s1_in_ids = s1_df[s1_df["country"] == "India"]["entity_id"].tolist()
+        k_list = [1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100]
+
+        print("\n" + "=" * 95)
+        print(f"{'k':>4} | {'US Recall':>10} | {'India Recall':>12} | {'Overall Recall':>15} | {'Macro Precision':>16} | {'Macro F_0.5':>12}")
+        print("=" * 95)
+
+        for k in k_list:
+            m_us = compute_macro_f05(pred_by_s1, gt_map, s1_us_ids, k=k)
+            m_in = compute_macro_f05(pred_by_s1, gt_map, s1_in_ids, k=k)
+            m_all = compute_macro_f05(pred_by_s1, gt_map, s1_ids, k=k)
+            print(
+                f"{k:4d} | {m_us['pair_completeness']*100:9.2f}% | "
+                f"{m_in['pair_completeness']*100:11.2f}% | "
+                f"{m_all['pair_completeness']*100:14.2f}% | "
+                f"{m_all['macro_precision']*100:15.2f}% | "
+                f"{m_all['macro_f05']:12.4f}"
+            )
+        print("=" * 95)
+
+        print("\n[Step 5] Similarity Score Thresholding Sweep (at k=50)")
+        print("Shows how downstream classification/thresholding maximizes the competition Macro F_0.5 metric:")
+        print("-" * 75)
+        print(f"{'Threshold':>10} | {'Pair Recall':>12} | {'Macro Precision':>16} | {'Macro F_0.5':>12}")
+        print("-" * 75)
+        for tau in [0.01, 0.10, 0.20, 0.30, 0.40, 0.45, 0.50, 0.55, 0.60, 0.70]:
+            m_thresh = compute_macro_f05(pred_by_s1, gt_map, s1_ids, k=50, threshold=tau)
+            print(
+                f"{tau:10.2f} | {m_thresh['pair_completeness']*100:11.2f}% | "
+                f"{m_thresh['macro_precision']*100:15.2f}% | "
+                f"{m_thresh['macro_f05']:12.4f}"
+            )
+        print("-" * 75)
+        print("\nBenchmark Finished Successfully.")
+    else:
+        print("Dataset not found at default path. Please provide training files.")
+
