@@ -1,0 +1,49 @@
+================================================================================
+STEP 7: GPU-ACCELERATED CANDIDATE RETRIEVAL BENCHMARK
+================================================================================
+GPU Device: NVIDIA GeForce RTX 3060 Laptop GPU | Total VRAM: 5803.6 MB (5.67 GB)
+
+[Step 1] Loading 5,000 real S1 queries...
+[Step 2] Loading ground truth...
+[Step 3] Assembling candidate pool (true candidates + distractors)...
+  Pool assembled: 150,266 candidates (266 true + 150,000 distractors)
+
+[Step 4] Fitting TF-IDF Vectorizer (3,4, min_df=5, max_df=0.05)...
+  Vectorizer fitted in 7.96s | Vocab: 70,053
+
+[Step 5] Transforming to TF-IDF sparse matrices...
+  Transform time: 9.81s | Cand matrix: (150266, 70053), Query: (5000, 70053)
+
+[Step 6] Fitting TruncatedSVD(n_components=128)...
+  SVD fitted in 6.67s | Cumulative Explained Variance: 16.79%
+  Transforming candidates & queries to 128-dim dense vectors...
+  Dense transform done in 1.02s
+
+[Step 7] VRAM Check for 150,266 candidates (dim=128):
+  Estimated VRAM needed: 523.4 MB
+  Total Available VRAM: 5803.6 MB
+  Safe for GPU execution? True
+  Building faiss.IndexFlatIP on GPU...
+  Index built: GPU IndexFlatIP in 0.468s
+  VRAM allocated by PyTorch/Faiss: 0.00 MB
+
+[Step 8] Batch-querying 5,000 queries (k=30) on GPU IndexFlatIP...
+  Search completed in 0.318s (15723.0 queries/sec)!
+
+[Step 9] Formatting candidates in standard schema:
+  Schema: (source1_entity_id, candidate_entity_id, score, rank, country)
+  Sample rows:
+    ('S1-755362802', np.str_('S2-563483177'), 0.8959, 1, 'India')
+    ('S1-755362802', np.str_('S2-469201780'), 0.8457, 2, 'India')
+    ('S1-755362802', np.str_('S2-873757220'), 0.8277, 3, 'India')
+    ('S1-755362802', np.str_('S2-258196012'), 0.8227, 4, 'India')
+    ('S1-755362802', np.str_('S2-115225996'), 0.7915, 5, 'India')
+
+[Step 10] Evaluating Accuracy against Ground Truth:
+Traceback (most recent call last):
+  File "/home/meerpi/curr_project/ML_AMAZON/scratch/test_gpu_blocker.py", line 276, in <module>
+    run_gpu_benchmark()
+    ~~~~~~~~~~~~~~~~~^^
+  File "/home/meerpi/curr_project/ML_AMAZON/scratch/test_gpu_blocker.py", line 246, in run_gpu_benchmark
+    metrics = compute_macro_f05(gt_map, pred_pairs)
+TypeError: compute_macro_f05() missing 1 required positional argument: 'all_s1_ids'
