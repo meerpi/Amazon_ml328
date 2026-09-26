@@ -1,3 +1,4 @@
+anyascii>=0.3.3
 asttokens==3.0.2
 cloudpickle==3.1.2
 comm==0.2.3
